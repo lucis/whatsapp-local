@@ -20,12 +20,14 @@ This plan extends the WhatsApp Web.js integration (see `mcp-whatsapp.md`) with a
 ## Architecture Extension
 
 This module extends the existing WhatsApp infrastructure with:
-- New database tables for message planning
+- New database tables for message planning (in local SQLite: `./data/whatsapp.db`)
 - AI-powered message generation tools
 - Group filtering and selection tools
-- Batch sending orchestration
+- Batch sending orchestration (via bot HTTP API)
 - Review and approval workflow
 - Dedicated UI for message planning
+
+**Note**: This plan assumes the local SQLite architecture from `mcp-whatsapp.md`. The bot writes directly to the local SQLite database, and the MCP server queries it via HTTP endpoints.
 
 ## Phase 1: Database Schema Extension
 

@@ -14,37 +14,58 @@ Due to WhatsApp Web.js requiring Chrome/browser execution, we'll use a hybrid ar
 ┌─────────────────────────────────────────────────────────────┐
 │                    Local Machine                             │
 │  ┌────────────────────────────────────────────────────┐    │
-│  │  WhatsApp Web.js Bot (Node.js + Chrome)           │    │
-│  │  - QR Code Authentication                          │    │
-│  │  - Message Listening                               │    │
-│  │  - Event Processing                                │    │
+│  │  WhatsApp Web.js Bot (Node.js + Puppeteer)        │    │
+│  │  - QR Code Authentication (LocalAuth)             │    │
+│  │  - Message Listening (40 msgs/min limit)          │    │
+│  │  - Event Processing (message, message_ack, etc)   │    │
 │  │  - Send/Receive Messages                           │    │
+│  │  - Media Download (base64 MessageMedia)           │    │
 │  └──────────────────┬─────────────────────────────────┘    │
-│                     │ HTTPS/WebSocket                       │
+│                     │                                        │
+│  ┌─────────────────┴──────────┬────────────────────────┐   │
+│  │                            │                         │   │
+│  │  SQLite Database (Local)   │  R2 Storage (Media)    │   │
+│  │  - Messages                │  - Images              │   │
+│  │  - Contacts                │  - Videos              │   │
+│  │  - Groups                  │  - Audio               │   │
+│  │  - Conversations           │  - Documents           │   │
+│  │  - Channel Rules           │  - Stickers            │   │
+│  │  File: ./data/whatsapp.db  │  - Thumbnails          │   │
+│  └────────────────────────────┴────────────────────────┘   │
+│                     │ HTTPS API                             │
 └─────────────────────┼─────────────────────────────────────┘
                       │
                       ▼
 ┌─────────────────────────────────────────────────────────────┐
 │           Deco MCP Server (Cloudflare Workers)              │
 │  ┌────────────────────────────────────────────────────┐    │
-│  │  Tools & Workflows                                 │    │
-│  │  - Message Processing                              │    │
-│  │  - Contact/Group Sync                              │    │
-│  │  - Allow/Block Rules                               │    │
-│  │  - Duplicate Detection                             │    │
-│  └──────────────────┬─────────────────────────────────┘    │
-│                     │                                        │
-│  ┌─────────────────┴──────────┬────────────────────────┐   │
-│  │                            │                         │   │
-│  │  Database (SQLite)         │  R2 Storage (Media)    │   │
-│  │  - Messages                │  - Images              │   │
-│  │  - Contacts                │  - Videos              │   │
-│  │  - Groups                  │  - Audio               │   │
-│  │  - Conversations           │  - Documents           │   │
-│  │  - Channel Rules           │  - Stickers            │   │
-│  └────────────────────────────┴────────────────────────┘   │
+│  │  Tools & Workflows (RPC Interface)                 │    │
+│  │  - Query local SQLite via HTTP                     │    │
+│  │  - AI Analysis & Generation                        │    │
+│  │  - Message Planning                                │    │
+│  │  - Frontend Views                                  │    │
+│  └────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+**Key Architecture Decision: Local SQLite Database**
+
+Instead of using Deco's Durable Objects SQLite, we use a **local SQLite file** (`./data/whatsapp.db`) stored in the repository. This decision is made because:
+
+1. **Data Locality**: All WhatsApp data stays on the same machine as the bot
+2. **Simplified Sync**: No need to sync data to remote database
+3. **Performance**: Direct file access is faster than remote DB calls
+4. **Backup**: Easy to backup - just copy the SQLite file
+5. **Privacy**: Sensitive WhatsApp data never leaves the local machine
+6. **Cost**: No database hosting costs
+
+The MCP server will expose HTTP endpoints that the local bot can call to:
+- Query the SQLite database
+- Trigger AI analysis
+- Manage message planning
+- Serve the frontend UI
+
+The bot will directly write to the local SQLite file and call MCP endpoints for advanced operations.
 
 ## Phase 1: Core Infrastructure
 
@@ -245,46 +266,71 @@ export const channelRulesAccountIdIndex = index("channel_rules_account_id_idx").
 Create a separate Node.js service that runs locally:
 
 ```
-/whatsapp-bot/ (new directory, outside the main project)
+/whatsapp-bot/ (new directory, in the repository root)
   /src/
     /bot.js           - Main WhatsApp Web.js initialization
     /handlers/
       /message.js     - Message event handlers
       /contact.js     - Contact sync handlers
       /group.js       - Group sync handlers
+      /auth.js        - QR code and authentication
+    /database/
+      /db.js          - SQLite connection and queries
+      /migrations/    - Database migrations
+    /storage/
+      /media.js       - R2 media upload/download
     /api/
+      /server.js      - Express server for MCP to call
       /client.js      - HTTP client to communicate with MCP server
     /config.js        - Bot configuration
+  /data/
+    whatsapp.db       - SQLite database file
+    /sessions/        - WhatsApp Web.js session data (LocalAuth)
   package.json
   .env
+  .gitignore          - Ignore sessions/ and data/
 ```
 
 ### 2.2 Bot Responsibilities
 
 1. **WhatsApp Connection Management**
-   - QR code generation for authentication
-   - Session persistence (local storage)
-   - Reconnection logic
-   - Health checks
+   - QR code generation for authentication (`client.on('qr')`)
+   - Session persistence using LocalAuth strategy
+   - Auto-reconnection on disconnect (`client.on('disconnected')`)
+   - Health checks and state monitoring
+   - Graceful shutdown handling
 
-2. **Event Listening**
-   - New messages
-   - Message updates (edits, deletions)
-   - Contact changes
-   - Group updates (members, info)
-   - Presence updates
+2. **Event Listening** (All WhatsApp Web.js Events)
+   - `message` - New messages received
+   - `message_create` - Messages sent by user
+   - `message_ack` - Delivery status (1=sent, 2=delivered, 3=read)
+   - `message_revoke_everyone` - Deleted messages
+   - `message_revoke_me` - Revoked messages
+   - `message_reaction` - Reactions to messages
+   - `group_join` - Member joins group
+   - `group_leave` - Member leaves group
+   - `group_update` - Group info changes
+   - `contact_changed` - Contact updates
+   - `change_state` - Connection state changes
 
-3. **Data Forwarding**
-   - Send events to MCP server via HTTPS
-   - Include authentication token
-   - Retry logic for failed requests
-   - Batch processing for bulk operations
+3. **Direct SQLite Operations**
+   - Write messages, contacts, groups to local SQLite
+   - Query for duplicate detection
+   - Update delivery status (ack)
+   - No need to forward to MCP - data is local!
 
 4. **Media Handling**
-   - Download media from WhatsApp
-   - Convert to base64 or buffer
-   - Send to MCP server for R2 upload
-   - Handle large files (streaming)
+   - Download media using `message.downloadMedia()`
+   - Returns MessageMedia object with base64 data
+   - Upload to R2 via HTTP endpoint
+   - Store R2 keys in SQLite
+   - Handle 64MB file size limit
+   - Generate thumbnails for videos
+
+5. **Rate Limiting**
+   - Enforce 40 messages/minute limit
+   - Queue messages with delays
+   - Prevent WhatsApp bans
 
 ## Phase 3: MCP Server Tools
 
@@ -733,31 +779,94 @@ Steps:
 
 ## Phase 5: Bot Communication Protocol
 
-### 5.1 Webhook/API Endpoints
+### 5.1 Local SQLite Access Pattern
 
-The bot will call these MCP tools via the RPC client:
+**The bot writes directly to SQLite - no HTTP calls for basic operations:**
 
-```typescript
-// Bot sends events like:
-POST /mcp/call/WHATSAPP_SAVE_MESSAGE
-{
-  accountId: 1,
-  whatsappId: "true_5511999999999@c.us_3A1234567890ABCDEF",
-  conversationWhatsappId: "5511999999999@c.us",
-  fromWhatsappId: "5511999999999@c.us",
-  type: "text",
-  body: "Hello World",
-  timestamp: 1699999999,
-  isFromMe: false,
-  ack: 1
-}
+```javascript
+// whatsapp-bot/src/handlers/message.js
+const db = require('../database/db');
+
+client.on('message', async (message) => {
+  // Write directly to local SQLite
+  await db.messages.insert({
+    whatsappId: message.id._serialized,
+    conversationId: message.from,
+    fromWhatsappId: message.author || message.from,
+    type: message.type,
+    body: message.body,
+    timestamp: message.timestamp,
+    isFromMe: message.fromMe,
+    ack: 1,
+    hasMedia: message.hasMedia
+  });
+  
+  // Download and upload media if present
+  if (message.hasMedia) {
+    const media = await message.downloadMedia();
+    const r2Key = await uploadToR2(media);
+    await db.messages.updateMedia(message.id._serialized, r2Key);
+  }
+});
+
+// Update ACK status
+client.on('message_ack', async (message, ack) => {
+  await db.messages.updateAck(message.id._serialized, ack);
+});
 ```
 
-### 5.2 Authentication
+### 5.2 Bot HTTP API (for MCP to call)
 
-- Bot will use API key authentication
-- Store bot API key in environment variables
-- Validate on every request to MCP tools
+The bot exposes HTTP endpoints for the MCP server to call:
+
+```javascript
+// whatsapp-bot/src/api/server.js
+const express = require('express');
+const app = express();
+
+// Send message (for message planner)
+app.post('/send-message', async (req, res) => {
+  const { to, message } = req.body;
+  const chatId = to.includes('@') ? to : `${to}@c.us`;
+  
+  try {
+    await rateLimiter.wait(); // 40 msgs/min
+    const sent = await client.sendMessage(chatId, message);
+    res.json({ 
+      success: true, 
+      messageId: sent.id._serialized 
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Query SQLite (for MCP views)
+app.post('/query', async (req, res) => {
+  const { sql, params } = req.body;
+  const results = await db.query(sql, params);
+  res.json(results);
+});
+
+// Get bot status
+app.get('/status', (req, res) => {
+  res.json({
+    connected: client.info !== null,
+    phone: client.info?.wid?.user,
+    platform: client.info?.platform
+  });
+});
+
+app.listen(3001, () => {
+  console.log('Bot API running on port 3001');
+});
+```
+
+### 5.3 Authentication
+
+- Bot API uses API key authentication
+- Shared secret between bot and MCP server
+- Store in environment variables (both sides)
 
 ## Phase 6: Idempotency & Deduplication
 
